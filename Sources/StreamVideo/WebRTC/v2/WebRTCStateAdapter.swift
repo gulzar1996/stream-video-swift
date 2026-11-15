@@ -48,6 +48,7 @@ actor WebRTCStateAdapter: ObservableObject, StreamAudioSessionAdapterDelegate, W
     let screenShareSessionProvider: ScreenShareSessionProvider
     let audioSession: CallAudioSession
     let trackStorage: WebRTCTrackStorage = .init()
+    nonisolated let videoUpscaling = VideoUpscalingController()
 
     /// The latest non-empty session id observed during the call's lifetime.
     ///
@@ -135,6 +136,16 @@ actor WebRTCStateAdapter: ObservableObject, StreamAudioSessionAdapterDelegate, W
         clientEventReporter: clientEventReporter
     )
     private var pendingDecryptors: [PendingDecryptor] = []
+    private var pendingVideoUpscaling: [PendingDecryptor] = []
+    private var departedUpscalingLookups: Set<String> = []
+    private struct UpscalingAttachment {
+        let track: VideoUpscalingTrack
+        let receiver: NativeVideoUpscalingReceiver
+    }
+
+    private var upscalingTracks: [String: [TrackType: UpscalingAttachment]] = [:]
+    private var upscalingGeneration = 0
+    private var acceptsUpscalingReceivers = true
 
     /// A remote track that arrived before its participant was known.
     ///
@@ -624,7 +635,9 @@ actor WebRTCStateAdapter: ObservableObject, StreamAudioSessionAdapterDelegate, W
             )
         )
         self.subscriber = subscriber
+        acceptsUpscalingReceivers = true
         subscriber.completeSetUp()
+        await reconcileVideoUpscalingTracks()
     }
 
     /// Cleans up the WebRTC session by closing connections and resetting
@@ -633,6 +646,12 @@ actor WebRTCStateAdapter: ObservableObject, StreamAudioSessionAdapterDelegate, W
     /// Pending decryptors are dropped because their `RTCRtpReceiver`s die
     /// with the peer connections.
     func cleanUp() async {
+        acceptsUpscalingReceivers = false
+        upscalingGeneration += 1
+        pendingVideoUpscaling.removeAll()
+        departedUpscalingLookups.removeAll()
+        upscalingTracks.removeAll()
+        await videoUpscaling.disconnect(reconnecting: false)
         screenShareSessionProvider.activeSession = nil
         videoCaptureSessionProvider.activeSession = nil
         pendingPeerConnectionTracesDisposableBag.removeAll()
@@ -668,6 +687,12 @@ actor WebRTCStateAdapter: ObservableObject, StreamAudioSessionAdapterDelegate, W
     /// Pending decryptors are dropped with the old peer connections.
     /// ``e2eeManager`` is **kept** so the rebuilt PCs still encrypt/decrypt.
     func cleanUpForReconnection() async {
+        acceptsUpscalingReceivers = false
+        upscalingGeneration += 1
+        pendingVideoUpscaling.removeAll()
+        departedUpscalingLookups.removeAll()
+        upscalingTracks.removeAll()
+        await videoUpscaling.disconnect(reconnecting: true)
         set(
             participants: participants
                 /// We remove the existing user in order to avoid showing a stale video tile
@@ -749,13 +774,20 @@ actor WebRTCStateAdapter: ObservableObject, StreamAudioSessionAdapterDelegate, W
     /// - Parameters:
     ///   - id: The participant ID whose track should be removed.
     ///   - type: The type of track (audio, video, screenshare) or `nil` to remove all.
-    func didRemoveTrack(for id: String, type: TrackType? = nil) async {
+    func didRemoveTrack(for id: String, type: TrackType? = nil, expectedTrack: RTCMediaStreamTrack? = nil) async {
+        if let expectedTrack, let type,
+           trackStorage.track(for: id, of: type)?.isEqual(expectedTrack) != true { return }
         let removedTracks = tracks(for: id, type: type)
         trackStorage.removeTrack(for: id, type: type)
+        pendingVideoUpscaling.removeAll { $0.lookupId == id && (type == nil || $0.trackType == type) }
+        let mappings = (upscalingTracks[id] ?? [:]).filter { type == nil || $0.key == type }
+        for trackType in mappings.keys { upscalingTracks[id]?[trackType] = nil }
         for removedTrack in removedTracks {
             await mediaFrameReporter.remove(removedTrack.track, type: removedTrack.type)
         }
-
+        for attachment in mappings.values {
+            await videoUpscaling.remove(attachment.track, matching: attachment.receiver)
+        }
         enqueue { $0 }
     }
 
@@ -1026,18 +1058,49 @@ actor WebRTCStateAdapter: ObservableObject, StreamAudioSessionAdapterDelegate, W
         functionName: StaticString = #function,
         fileName: StaticString = #fileID,
         lineNumber: UInt = #line
-    ) {
+    ) async {
         /// Retrieves the current participants.
         let current = participants
         /// Applies the operation to get the next state of participants.
         let next = operation(current)
         /// Assigns media tracks to the participants.
         let updated = assignTracks(on: next)
-        /// Sends the updated participants to observers while helping publishing streamlined updates.
+        let generation = upscalingGeneration
+        let activeSessions = Set(updated.values.map(\.sessionId))
+        let departed = Set(current.values.map(\.sessionId)).subtracting(activeSessions)
+        for participant in current.values where departed.contains(participant.sessionId) {
+            departedUpscalingLookups.insert(participant.sessionId)
+            if let lookup = participant.trackLookupPrefix, !lookup.isEmpty {
+                departedUpscalingLookups.insert(lookup)
+            }
+        }
+        for participant in updated.values {
+            departedUpscalingLookups.remove(participant.sessionId)
+            if let lookup = participant.trackLookupPrefix { departedUpscalingLookups.remove(lookup) }
+        }
+        pendingVideoUpscaling.removeAll { departedUpscalingLookups.contains($0.lookupId) }
+        // Stop resolving departed sessions before receiver cleanup can suspend.
         set(participants: updated)
+        for sessionID in departed {
+            await videoUpscaling.participantLeft(sessionID)
+            guard generation == upscalingGeneration else { return }
+            upscalingTracks = upscalingTracks.mapValues {
+                $0.filter { $0.value.track.participantSessionID != sessionID }
+            }
+        }
         /// Participant ids may now resolve user ids for tracks that arrived
         /// earlier; attach any decryptors that were waiting.
         flushPendingDecryptors()
+        let pending = pendingVideoUpscaling
+        pendingVideoUpscaling.removeAll()
+        for item in pending {
+            guard generation == upscalingGeneration else { return }
+            await attachVideoUpscaling(
+                lookupId: item.lookupId, trackType: item.trackType,
+                receiver: item.receiver
+            )
+        }
+        await reconcileVideoUpscalingTracks()
 
         /// Logs the completion of the participant operation.
         log.debug(
@@ -1114,6 +1177,7 @@ actor WebRTCStateAdapter: ObservableObject, StreamAudioSessionAdapterDelegate, W
             await didAddTrack(track, type: trackType, for: id)
             if peerConnectionType == .subscriber {
                 if let receiver = subscriber?.rtpReceiver(matching: track) {
+                    await attachVideoUpscaling(lookupId: id, trackType: trackType, receiver: receiver)
                     attachDecryptor(
                         lookupId: id,
                         trackType: trackType,
@@ -1126,8 +1190,48 @@ actor WebRTCStateAdapter: ObservableObject, StreamAudioSessionAdapterDelegate, W
                     )
                 }
             }
-        case let .removed(id, trackType, _):
-            await didRemoveTrack(for: id, type: trackType)
+        case let .removed(id, trackType, track):
+            await didRemoveTrack(for: id, type: trackType, expectedTrack: track)
+        }
+    }
+
+    /// Attaches received-video processing once a track's session is known.
+    func attachVideoUpscaling(
+        lookupId: String,
+        trackType: TrackType,
+        receiver: RTCRtpReceiver
+    ) async {
+        guard acceptsUpscalingReceivers, !departedUpscalingLookups.contains(lookupId),
+              trackType == .video || trackType == .screenshare else { return }
+        guard let participant = participants.values.first(where: {
+            $0.sessionId == lookupId || (!($0.trackLookupPrefix ?? "").isEmpty && $0.trackLookupPrefix == lookupId)
+        }) else {
+            pendingVideoUpscaling.removeAll { $0.lookupId == lookupId && $0.trackType == trackType }
+            pendingVideoUpscaling.append(.init(lookupId: lookupId, trackType: trackType, receiver: receiver))
+            return
+        }
+        guard participant.sessionId != sessionID else { return }
+        let track = VideoUpscalingTrack(
+            participantSessionID: participant.sessionId,
+            source: trackType == .screenshare ? .screenShare : .camera
+        )
+        let handle = NativeVideoUpscalingReceiver(receiver)
+        upscalingTracks[lookupId, default: [:]][trackType] = .init(track: track, receiver: handle)
+        await videoUpscaling.attach(handle, for: track)
+    }
+
+    private func reconcileVideoUpscalingTracks() async {
+        guard acceptsUpscalingReceivers, let subscriber else { return }
+        let generation = upscalingGeneration
+        for participant in participants.values where participant.sessionId != sessionID {
+            let lookup = participant.trackLookupPrefix.flatMap { $0.isEmpty ? nil : $0 } ?? participant.sessionId
+            for type in [TrackType.video, .screenshare] {
+                guard generation == upscalingGeneration else { return }
+                guard upscalingTracks[lookup]?[type] == nil,
+                      let track = track(for: participant, of: type),
+                      let receiver = subscriber.rtpReceiver(matching: track) else { continue }
+                await attachVideoUpscaling(lookupId: lookup, trackType: type, receiver: receiver)
+            }
         }
     }
 

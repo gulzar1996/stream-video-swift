@@ -1,0 +1,371 @@
+diff --git a/api/BUILD.gn b/api/BUILD.gn
+index 1783714..05364bd 100644
+--- a/api/BUILD.gn
++++ b/api/BUILD.gn
+@@ -510,6 +510,7 @@ rtc_library("rtp_receiver_interface") {
+     "rtp_receiver_interface.h",
+   ]
+   deps = [
++        "video:video_frame",
+     ":dtls_transport_interface",
+     ":frame_transformer_interface",
+     ":media_stream_interface",
+diff --git a/api/rtp_receiver_interface.h b/api/rtp_receiver_interface.h
+index de2ed0d..85848e8 100644
+--- a/api/rtp_receiver_interface.h
++++ b/api/rtp_receiver_interface.h
+@@ -15,6 +15,7 @@
+ #define API_RTP_RECEIVER_INTERFACE_H_
+ 
+ #include <optional>
++#include <functional>
+ #include <string>
+ #include <utility>
+ #include <vector>
+@@ -31,11 +32,24 @@
+ #include "api/sframe/sframe_decryptor_interface.h"
+ #include "api/sframe/sframe_types.h"
+ #include "api/transport/rtp/rtp_source.h"
++#include "api/video/video_frame.h"
+ #include "rtc_base/checks.h"
+ #include "rtc_base/system/rtc_export.h"
+ 
+ namespace webrtc {
+ 
++/// Processes decoded frames before the receiver broadcasts to renderers.
++class RTC_EXPORT ReceivedVideoFrameProcessor : public RefCountInterface {
++ public:
++  virtual void Process(const VideoFrame& frame,
++                       std::function<void(const VideoFrame&)> deliver) = 0;
++  virtual void Stop() = 0;
++};
++
++using ReceivedVideoProcessorUpdate = std::function<
++    scoped_refptr<ReceivedVideoFrameProcessor>(
++        scoped_refptr<ReceivedVideoFrameProcessor>)>;
++
+ class RtpReceiverObserverInterface {
+  public:
+   // Note: Currently if there are multiple RtpReceivers of the same media type,
+@@ -65,6 +79,8 @@ class RtpReceiverObserverInterface {
+ class RTC_EXPORT RtpReceiverInterface : public RefCountInterface,
+                                         public FrameTransformerHost {
+  public:
++  /// Runs an atomic processor update on the receiver's worker thread.
++  virtual void UpdateReceivedVideoProcessor(ReceivedVideoProcessorUpdate update) {}
+   virtual scoped_refptr<MediaStreamTrackInterface> track() const = 0;
+ 
+   // The dtlsTransport attribute exposes the DTLS transport on which the
+diff --git a/pc/BUILD.gn b/pc/BUILD.gn
+index b56474d..8ab7270 100644
+--- a/pc/BUILD.gn
++++ b/pc/BUILD.gn
+@@ -1984,6 +1984,8 @@ rtc_library("video_rtp_track_source") {
+     "video_rtp_track_source.h",
+   ]
+   deps = [
++        "../api:rtp_receiver_interface",
++        "../api:scoped_refptr",
+     ":video_track_source",
+     "../api:sequence_checker",
+     "../api/video:recordable_encoded_frame",
+@@ -4745,3 +4747,16 @@ if (rtc_include_tests && !build_with_chromium) {
+     }
+   }
+ }
++
++# Physical-device regression support; not linked into the shipping framework.
++rtc_static_library("video_upscaling_test_support") {
++  testonly = true
++  complete_static_lib = true
++  suppressed_configs += [ "//build/config/compiler:thin_archive" ]
++  sources = [ "//stream_video_tests/source_tests.cc" ]
++  deps = [
++    ":video_rtp_track_source",
++    "//api:make_ref_counted",
++    "//api/video:video_frame",
++  ]
++}
+diff --git a/pc/rtp_receiver_proxy.h b/pc/rtp_receiver_proxy.h
+index ea51ea1..875fe18 100644
+--- a/pc/rtp_receiver_proxy.h
++++ b/pc/rtp_receiver_proxy.h
+@@ -52,6 +52,8 @@ PROXY_CONSTMETHOD0(std::vector<RtpSource>, GetSources)
+ PROXY_SECONDARY_METHOD1(void,
+                         SetFrameDecryptor,
+                         scoped_refptr<FrameDecryptorInterface>)
++PROXY_SECONDARY_METHOD1(void, UpdateReceivedVideoProcessor,
++                       ReceivedVideoProcessorUpdate)
+ // TODO(bugs.webrtc.org/12772): Remove.
+ PROXY_SECONDARY_CONSTMETHOD0(scoped_refptr<FrameDecryptorInterface>,
+                              GetFrameDecryptor)
+diff --git a/pc/video_rtp_receiver.cc b/pc/video_rtp_receiver.cc
+index 38f5704..45d7e2c 100644
+--- a/pc/video_rtp_receiver.cc
++++ b/pc/video_rtp_receiver.cc
+@@ -117,10 +117,17 @@ RtpParameters VideoRtpReceiver::GetParameters() const {
+ 
+ void VideoRtpReceiver::Stop() {
+   RTC_DCHECK_RUN_ON(&signaling_thread_checker_);
++  source_->StopProcessing();
+   source_->SetState(MediaSourceInterface::kEnded);
+   track_->internal()->set_ended();
+ }
+ 
++void VideoRtpReceiver::UpdateReceivedVideoProcessor(
++    ReceivedVideoProcessorUpdate update) {
++  RTC_DCHECK_RUN_ON(worker_thread_);
++  source_->UpdateProcessor(std::move(update));
++}
++
+ void VideoRtpReceiver::OnChanged() {
+   RTC_DCHECK_RUN_ON(&signaling_thread_checker_);
+   if (cached_track_should_receive_ != track_->should_receive()) {
+diff --git a/pc/video_rtp_receiver.h b/pc/video_rtp_receiver.h
+index b008b01..4d04c1d 100644
+--- a/pc/video_rtp_receiver.h
++++ b/pc/video_rtp_receiver.h
+@@ -83,6 +83,7 @@ class VideoRtpReceiver : public RtpReceiverBase,
+   std::string id() const override { return id_; }
+ 
+   RtpParameters GetParameters() const override;
++  void UpdateReceivedVideoProcessor(ReceivedVideoProcessorUpdate update) override;
+ 
+   // RtpReceiverInternal implementation.
+   void Stop() override;
+diff --git a/pc/video_rtp_track_source.cc b/pc/video_rtp_track_source.cc
+index 48fa27d..bcc6507 100644
+--- a/pc/video_rtp_track_source.cc
++++ b/pc/video_rtp_track_source.cc
+@@ -29,6 +29,10 @@ VideoRtpTrackSource::VideoRtpTrackSource(Callback* callback)
+ 
+ void VideoRtpTrackSource::ClearCallback() {
+   RTC_DCHECK_RUN_ON(&worker_sequence_checker_);
++  {
++    MutexLock lock(&processor_mutex_);
++    ++processor_generation_;
++  }
+   callback_ = nullptr;
+ }
+ 
+@@ -36,7 +40,64 @@ VideoSourceInterface<VideoFrame>* VideoRtpTrackSource::source() {
+   return &broadcaster_;
+ }
+ VideoSinkInterface<VideoFrame>* VideoRtpTrackSource::sink() {
+-  return &broadcaster_;
++  return this;
++}
++
++void VideoRtpTrackSource::OnFrame(const VideoFrame& frame) {
++  scoped_refptr<ReceivedVideoFrameProcessor> processor;
++  uint64_t generation;
++  {
++    MutexLock lock(&processor_mutex_);
++    if (processing_stopped_) return;
++    processor = processor_;
++    generation = processor_generation_;
++  }
++  if (!processor) {
++    broadcaster_.OnFrame(frame);
++    return;
++  }
++  processor->Process(frame,
++      [self = scoped_refptr<VideoRtpTrackSource>(this), generation](
++          const VideoFrame& output) {
++        {
++          MutexLock lock(&self->processor_mutex_);
++          if (self->processing_stopped_ ||
++              self->processor_generation_ != generation) return;
++        }
++        self->broadcaster_.OnFrame(output);
++      });
++}
++
++void VideoRtpTrackSource::UpdateProcessor(ReceivedVideoProcessorUpdate update) {
++  RTC_DCHECK_RUN_ON(&worker_sequence_checker_);
++  scoped_refptr<ReceivedVideoFrameProcessor> previous;
++  {
++    MutexLock lock(&processor_mutex_);
++    if (processing_stopped_) return;
++    previous = processor_;
++  }
++  auto next = update(previous);
++  {
++    MutexLock lock(&processor_mutex_);
++    if (processing_stopped_) {
++      if (next) next->Stop();
++      return;
++    }
++    ++processor_generation_;
++    processor_ = next;
++  }
++  if (previous && previous != next) previous->Stop();
++}
++
++void VideoRtpTrackSource::StopProcessing() {
++  scoped_refptr<ReceivedVideoFrameProcessor> previous;
++  {
++    MutexLock lock(&processor_mutex_);
++    processing_stopped_ = true;
++    ++processor_generation_;
++    previous = std::move(processor_);
++  }
++  if (previous) previous->Stop();
+ }
+ 
+ void VideoRtpTrackSource::BroadcastRecordableEncodedFrame(
+diff --git a/pc/video_rtp_track_source.h b/pc/video_rtp_track_source.h
+index 3c33e20..cf636a7 100644
+--- a/pc/video_rtp_track_source.h
++++ b/pc/video_rtp_track_source.h
+@@ -14,6 +14,7 @@
+ #include <vector>
+ 
+ #include "api/sequence_checker.h"
++#include "api/rtp_receiver_interface.h"
+ #include "api/video/recordable_encoded_frame.h"
+ #include "api/video/video_broadcaster.h"
+ #include "api/video/video_frame.h"
+@@ -27,7 +28,8 @@
+ namespace webrtc {
+ 
+ // Video track source in use by VideoRtpReceiver
+-class VideoRtpTrackSource : public VideoTrackSource {
++class VideoRtpTrackSource : public VideoTrackSource,
++                            public VideoSinkInterface<VideoFrame> {
+  public:
+   class Callback {
+    public:
+@@ -60,6 +62,9 @@ class VideoRtpTrackSource : public VideoTrackSource {
+   // VideoTrackSource
+   VideoSourceInterface<VideoFrame>* source() override;
+   VideoSinkInterface<VideoFrame>* sink();
++  void OnFrame(const VideoFrame& frame) override;
++  void UpdateProcessor(ReceivedVideoProcessorUpdate update);
++  void StopProcessing();
+ 
+   // Returns true. This method can be called on any thread.
+   bool SupportsEncodedOutput() const override;
+@@ -82,6 +87,11 @@ class VideoRtpTrackSource : public VideoTrackSource {
+   // It might be better if the decoder can handle multiple sinks and consider
+   // the VideoSinkWants.
+   VideoBroadcaster broadcaster_;
++  Mutex processor_mutex_;
++  scoped_refptr<ReceivedVideoFrameProcessor> processor_
++      RTC_GUARDED_BY(processor_mutex_);
++  uint64_t processor_generation_ RTC_GUARDED_BY(processor_mutex_) = 0;
++  bool processing_stopped_ RTC_GUARDED_BY(processor_mutex_) = false;
+   mutable Mutex mu_;
+   std::vector<VideoSinkInterface<RecordableEncodedFrame>*> encoded_sinks_
+       RTC_GUARDED_BY(mu_);
+diff --git a/sdk/BUILD.gn b/sdk/BUILD.gn
+index bc8f144..187c801 100644
+--- a/sdk/BUILD.gn
++++ b/sdk/BUILD.gn
+@@ -1096,6 +1096,29 @@ if (is_ios || is_mac) {
+       ]
+     }
+ 
++    rtc_library("video_upscaling_objc") {
++      sources = [
++        "objc/components/video_upscaling/RTCVideoUpscaling.h",
++        "objc/components/video_upscaling/frame_gate.h",
++        "objc/components/video_upscaling/upscaling_engine.h",
++        "objc/components/video_upscaling/upscaling_engine.mm",
++        "objc/components/video_upscaling/upscaling_processor.h",
++        "objc/components/video_upscaling/upscaling_processor.mm",
++      ]
++      configs += [ "..:common_objc" ]
++      frameworks = [
++        "CoreGraphics.framework",
++        "CoreImage.framework",
++        "CoreMedia.framework",
++        "CoreVideo.framework",
++        "Metal.framework",
++      ]
++      weak_frameworks = [ "VideoToolbox.framework" ]
++      if (target_environment != "simulator") {
++        weak_frameworks += [ "MetalFX.framework" ]
++      }
++    }
++
+     rtc_library("peerconnectionfactory_base_objc") {
+       visibility = [ "*" ]
+       allow_poison = [
+@@ -1107,6 +1130,9 @@ if (is_ios || is_mac) {
+         defines = [ "RTC_STREAM_RENDERING_BACKEND" ]
+       }
+       sources = [
++        "objc/components/video_upscaling/color_compatibility.h",
++        "objc/components/video_upscaling/receiver_bridge.h",
++        "objc/components/video_upscaling/receiver_bridge.mm",
+         "objc/api/peerconnection/RTCAudioDeviceModule+Private.h",
+         "objc/api/peerconnection/RTCAudioDeviceModule.h",
+         "objc/api/peerconnection/RTCAudioDeviceModule.mm",
+@@ -1264,6 +1290,9 @@ if (is_ios || is_mac) {
+       public_configs = [ ":common_config_objc" ]
+ 
+       deps = [
++        "../api:make_ref_counted",
++        "../third_party/libyuv",
++        ":video_upscaling_objc",
+         ":audio_device_api_objc",
+         ":audiorendereradapter_objc",
+         ":base_native_additions_objc",
+@@ -1505,6 +1534,7 @@ if (is_ios || is_mac) {
+         output_name = "WebRTC"
+ 
+         common_objc_headers = [
++          "objc/components/video_upscaling/RTCVideoUpscaling.h",
+           "objc/base/RTCCodecSpecificInfo.h",
+           "objc/base/RTCEncodedImage.h",
+           "objc/base/RTCI420Buffer.h",
+diff --git a/sdk/objc/api/peerconnection/RTCRtpReceiver.h b/sdk/objc/api/peerconnection/RTCRtpReceiver.h
+index e2ae27b..2ba6b2b 100644
+--- a/sdk/objc/api/peerconnection/RTCRtpReceiver.h
++++ b/sdk/objc/api/peerconnection/RTCRtpReceiver.h
+@@ -9,6 +9,9 @@
+  */
+ 
+ #import <Foundation/Foundation.h>
++#import "sdk/objc/components/video_upscaling/RTCVideoUpscaling.h"
++
++@class RTCVideoUpscalingStatus;
+ 
+ #import "RTCMediaStreamTrack.h"
+ #import "RTCRtpParameters.h"
+@@ -98,6 +101,10 @@ the current RTCRtpReceiver in the last ten seconds.
+ RTC_OBJC_EXPORT
+ @interface RTC_OBJC_TYPE (RTCRtpReceiver) : NSObject <RTC_OBJC_TYPE(RTCRtpReceiver)>
+ 
++/// Configures decoded-frame processing for this receiver.
++- (void)setVideoUpscalingConfiguration:(RTCVideoUpscalingConfiguration *)configuration
++                        statusHandler:(nullable void (^)(RTCVideoUpscalingStatus *))statusHandler;
++
+ - (instancetype)init NS_UNAVAILABLE;
+ 
+ @end
+diff --git a/sdk/objc/api/peerconnection/RTCRtpReceiver.mm b/sdk/objc/api/peerconnection/RTCRtpReceiver.mm
+index 0882caa..ca7da01 100644
+--- a/sdk/objc/api/peerconnection/RTCRtpReceiver.mm
++++ b/sdk/objc/api/peerconnection/RTCRtpReceiver.mm
+@@ -18,6 +18,7 @@
+ #import "helpers/NSString+StdString.h"
+ 
+ #include "api/media_stream_interface.h"
++#import "sdk/objc/components/video_upscaling/receiver_bridge.h"
+ 
+ namespace webrtc {
+ 
+@@ -61,6 +62,11 @@ void RtpReceiverDelegateAdapter::OnFirstPacketReceivedAfterReceptiveChange(
+ 
+ @synthesize delegate = _delegate;
+ 
++- (void)setVideoUpscalingConfiguration:(RTCVideoUpscalingConfiguration *)configuration
++                        statusHandler:(void (^)(RTCVideoUpscalingStatus *))statusHandler {
++  webrtc::ConfigureReceivedVideoUpscaling(_nativeRtpReceiver, configuration, statusHandler);
++}
++
+ - (NSString *)receiverId {
+   return [NSString stringForStdString:_nativeRtpReceiver->id()];
+ }

@@ -1,0 +1,95 @@
+name: VideoUpscalingTests
+options:
+  deploymentTarget:
+    iOS: "13.0"
+settings:
+  base:
+    CODE_SIGN_STYLE: Automatic
+    CLANG_CXX_LANGUAGE_STANDARD: c++17
+    TARGETED_DEVICE_FAMILY: "1,2"
+targets:
+  VideoUpscalingHost:
+    type: application
+    platform: iOS
+    sources: [Host]
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: io.getstream.local.VideoUpscalingHost
+        INFOPLIST_FILE: ../../TestTools/VideoUpscaling/Host/Info.plist
+  VideoUpscalingTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources:
+      - path: .
+        excludes: [Host, Receiver, NativeSource, SDK, README.md, project.yml]
+      - path: ../../Native/VideoUpscaling
+        excludes: [receiver_bridge.h, receiver_bridge.mm]
+    dependencies:
+      - target: VideoUpscalingHost
+      - sdk: CoreGraphics.framework
+      - sdk: CoreVideo.framework
+      - sdk: CoreMedia.framework
+      - sdk: CoreImage.framework
+      - sdk: Metal.framework
+      - sdk: MetalFX.framework
+        weak: true
+      - sdk: VideoToolbox.framework
+        weak: true
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: io.getstream.local.VideoUpscalingTests
+        GENERATE_INFOPLIST_FILE: YES
+        HEADER_SEARCH_PATHS: "$(SRCROOT)/../../Native/VideoUpscaling"
+  ReceiverTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources: [Receiver]
+    dependencies:
+      - target: VideoUpscalingHost
+      - framework: ../../.webrtc-work/webrtc/products/renamed/StreamWebRTC.xcframework
+        embed: true
+      - sdk: CoreVideo.framework
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: io.getstream.local.VideoUpscalingReceiverTests
+        GENERATE_INFOPLIST_FILE: YES
+  NativeSourceTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources:
+      - path: NativeSource
+        excludes: [source_tests.cc, BUILD.gn]
+    dependencies:
+      - target: VideoUpscalingHost
+      - framework: ../../.webrtc-work/webrtc/out/ios-arm64-device/obj/pc/libdevice_source_tests.a
+        embed: false
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: io.getstream.local.VideoUpscalingSourceTests
+        LIBRARY_SEARCH_PATHS: "$(SRCROOT)/../../.webrtc-work/webrtc/out/ios-arm64-device/obj/pc"
+        OTHER_LDFLAGS: "$(inherited) -lc++"
+        GENERATE_INFOPLIST_FILE: YES
+
+schemes:
+  VideoUpscalingTests:
+    build:
+      targets:
+        VideoUpscalingHost: all
+        VideoUpscalingTests: [test]
+    test:
+      targets: [VideoUpscalingTests]
+  ReceiverTests:
+    build:
+      targets:
+        VideoUpscalingHost: all
+        ReceiverTests: [test]
+    test:
+      targets: [ReceiverTests]
+
+  NativeSourceTests:
+    build:
+      targets:
+        VideoUpscalingHost: all
+        NativeSourceTests: [test]
+    test:
+      targets: [NativeSourceTests]

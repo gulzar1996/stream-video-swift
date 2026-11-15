@@ -16,6 +16,7 @@ struct DemoMoreControlsViewModifier: ViewModifier {
     @Injected(\.localParticipantSnapshotViewModel) var localParticipantSnapshotViewModel
 
     @State private var isStatsPresented = false
+    @State private var isUpscalingPresented = false
 
     init(viewModel: CallViewModel) {
         self.viewModel = viewModel
@@ -66,6 +67,13 @@ struct DemoMoreControlsViewModifier: ViewModifier {
                             DemoTranscriptionAndClosedCaptionsButtonView(viewModel: viewModel)
 
                             DemoMoreThermalStateButtonView()
+
+                            if viewModel.call != nil {
+                                DemoMoreControlListButtonView(
+                                    action: { isUpscalingPresented = true },
+                                    label: "Video upscaling"
+                                ) { Image(systemName: "sparkles.tv") }
+                            }
 
                             DemoMoreControlListButtonView(
                                 action: { isStatsPresented = true },
@@ -146,6 +154,9 @@ struct DemoMoreControlsViewModifier: ViewModifier {
                     }
                 }
                 .padding(.horizontal)
+                .sheet(isPresented: $isUpscalingPresented) {
+                    if let call = viewModel.call { DemoVideoUpscalingView(call: call) }
+                }
                 .sheet(isPresented: $isStatsPresented) {
                     DemoStatsView(
                         viewModel: viewModel,

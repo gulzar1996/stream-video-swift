@@ -3,6 +3,7 @@
 //
 
 import Combine
+import Foundation
 import StreamVideo
 import StreamVideoSwiftUI
 import SwiftUI
@@ -142,4 +143,26 @@ private func content() {
             }
         }
     }
+}
+
+@MainActor
+private func receivedVideoUpscaling() async throws {
+    try await call.setVideoUpscaling(.init(backend: .metalFX))
+    let screen = VideoUpscalingTrack(
+        participantSessionID: otherParticipant.sessionId,
+        source: .screenShare
+    )
+    let capabilities = await call.videoUpscalingCapabilities(for: screen)
+    if let support = capabilities.backends.first(where: { $0.backend == .videoToolbox }),
+       support.isSupported, let scale = support.scaleFactors.first {
+        try await call.setVideoUpscaling(
+            .init(backend: .videoToolbox, scale: scale),
+            for: .track(screen)
+        )
+    }
+    let status = call.state.videoUpscalingStatuses[screen]
+    _ = status?.effectiveBackend
+    _ = status?.fallbackReason
+    await call.resetVideoUpscaling(for: .track(screen))
+    await call.resetVideoUpscaling()
 }

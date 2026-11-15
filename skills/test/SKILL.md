@@ -49,6 +49,19 @@ Otherwise, use Xcode or `xcodebuild` with equivalent settings.
 
 The formatting lane can edit files. Inspect its implementation and resulting diff.
 
+For demo signing failures, identify the target and configuration in the build log.
+Check the bundle ID, signing team, requested entitlements, and selected profile.
+A unique bundle ID does not resolve an unavailable App Group or missing profile
+capabilities. Keep local signing changes scoped to the affected configurations.
+Report any capabilities disabled for local builds.
+
+Physical devices require an app host for XCTest bundles that use a tool host
+on simulators. Preserve source and resource membership, exclusions, compiler
+conditions, and deployment targets. Include resources shared from other groups;
+nonvisual tests can still load bundled image fixtures. Match the app's camera
+and microphone usage descriptions. Missing descriptions can change SDK defaults
+before any capture starts.
+
 For focused execution, use `xcodebuild` with `-only-testing:Target/TestCase`.
 Select the project, scheme, test plan, and destination from current metadata.
 Preserve the command's exit status when filtering its output.

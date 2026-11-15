@@ -2,6 +2,7 @@
 // Copyright © 2026 Stream.io Inc. All rights reserved.
 //
 
+import Foundation
 import StreamVideo
 import StreamVideoSwiftUI
 import SwiftUI
@@ -74,11 +75,37 @@ final class DemoAppViewFactory: ViewFactory {
     }
 
     func makeCallControlsView(viewModel: CallViewModel) -> some View {
-        AppControlsWithChat(viewModel: viewModel)
+        VStack(spacing: 12) {
+            if let call = viewModel.call {
+                DemoVideoUpscalingBar(call: call)
+                    .id(ObjectIdentifier(call))
+                    .padding(.horizontal, 16)
+            }
+            AppControlsWithChat(viewModel: viewModel)
+        }
     }
 
     func makeCallTopView(viewModel: CallViewModel) -> some View {
         DemoCallTopView(viewFactory: self, viewModel: viewModel)
+    }
+
+    func makeVideoParticipantView(
+        participant: CallParticipant,
+        id: String,
+        availableFrame: CGRect,
+        contentMode: UIView.ContentMode,
+        customData: [String: RawJSON],
+        call: Call?
+    ) -> some View {
+        VideoCallParticipantView(
+            viewFactory: self,
+            participant: participant,
+            id: id,
+            availableFrame: availableFrame,
+            contentMode: .scaleAspectFit,
+            customData: customData,
+            call: call
+        )
     }
 
     func makeVideoCallParticipantModifier(

@@ -120,9 +120,16 @@ public class CallState: ObservableObject {
 
     @Published public internal(set) var statsCollectionInterval: Int = 0
 
-    /// A public enum representing the settings for incoming video streams in a WebRTC
-    /// session. This enum supports different policies like none, manual, or
-    /// disabled, each potentially applying to specific session IDs.
+    /// The call default for received-video processing.
+    @Published public internal(set) var videoUpscalingDefault: VideoUpscalingConfiguration = .off
+    /// Overrides keyed by participant session and media source.
+    @Published public internal(set) var videoUpscalingOverrides: [VideoUpscalingTrack: VideoUpscalingConfiguration] = [:]
+
+    /// Effective processing for each received camera or screen-share track.
+    @Published public internal(set) var videoUpscalingStatuses: [VideoUpscalingTrack: VideoUpscalingStatus] = [:]
+
+    /// Incoming video policies: none, manual, or disabled, optionally scoped
+    /// to participant session IDs.
     @Published public internal(set) var incomingVideoQualitySettings: IncomingVideoQualitySettings = .none
     
     /// This property holds the error that indicates the user has been disconnected

@@ -4,8 +4,9 @@
 
 import AVFoundation
 import Combine
+import Foundation
 @testable import StreamVideo
-import StreamWebRTC
+@preconcurrency import StreamWebRTC
 @preconcurrency import XCTest
 
 final class WebRTCStateAdapter_Tests: XCTestCase, @unchecked Sendable {
@@ -73,6 +74,110 @@ final class WebRTCStateAdapter_Tests: XCTestCase, @unchecked Sendable {
     override class func tearDown() {
         videoConfig = nil
         super.tearDown()
+    }
+
+    func test_videoUpscaling_reconnectRetainsSettingsAndCleanupClearsThem() async throws {
+        let track = VideoUpscalingTrack(participantSessionID: "remote")
+        let enabled = VideoUpscalingConfiguration(backend: .metalFX)
+        try await subject.videoUpscaling.set(enabled, for: .track(track))
+        await subject.cleanUpForReconnection()
+        await assertEqualAsync(await subject.videoUpscaling.configuration(for: track), enabled)
+        await subject.cleanUp()
+        await assertEqualAsync(await subject.videoUpscaling.configuration(for: track), .off)
+    }
+
+    func test_videoUpscaling_participantDepartureRemovesOverride() async throws {
+        let participant = CallParticipant.dummy(sessionId: "remote")
+        let track = VideoUpscalingTrack(participantSessionID: participant.sessionId)
+        await subject.enqueue { _ in [participant.sessionId: participant] }
+        await fulfillment { await self.subject.participants.count == 1 }
+        try await subject.videoUpscaling.set(.init(backend: .metalFX), for: .track(track))
+        await subject.enqueue { _ in [:] }
+        await fulfillment { await self.subject.participants.isEmpty }
+        await assertEqualAsync(await subject.videoUpscaling.configuration(for: track), .off)
+    }
+
+    func test_videoUpscaling_trackBeforeParticipantAppliesStoredOverride() async throws {
+        let participant = CallParticipant.dummy(trackLookupPrefix: "lookup", sessionId: "remote")
+        let track = VideoUpscalingTrack(participantSessionID: participant.sessionId)
+        let enabled = VideoUpscalingConfiguration(backend: .metalFX)
+        try await subject.videoUpscaling.set(enabled, for: .track(track))
+        let receiver = try makeReceiver()
+        await subject.attachVideoUpscaling(lookupId: "lookup", trackType: .video, receiver: receiver)
+        XCTAssertNil(subject.videoUpscaling.statuses.value[track])
+        await subject.enqueue { _ in [participant.sessionId: participant] }
+        await fulfillment {
+            self.subject.videoUpscaling.statuses.value[track]?.configuration == enabled
+        }
+    }
+
+    func test_videoUpscaling_removalDoesNotDeleteReplacementDuringSuspension() async throws {
+        let participant = CallParticipant.dummy(sessionId: "remote")
+        let key = VideoUpscalingTrack(participantSessionID: "remote")
+        let old = mockPeerConnectionFactory.mockVideoTrack(forScreenShare: false)
+        let replacement = mockPeerConnectionFactory.mockVideoTrack(forScreenShare: false)
+        await subject.enqueue { _ in [participant.sessionId: participant] }
+        await fulfillment { await self.subject.participants.count == 1 }
+        await subject.didAddTrack(old, type: .video, for: "remote")
+        await subject.attachVideoUpscaling(lookupId: "remote", trackType: .video, receiver: try makeReceiver())
+        let began = expectation(description: "Removal suspended")
+        let release = DispatchSemaphore(value: 0)
+        defer { release.signal() }
+        await fulfillment { self.subject.videoUpscaling.statuses.value[key] != nil }
+        let subscription = subject.videoUpscaling.statuses.sink { values in
+            if values[key] != nil { return }
+            began.fulfill()
+            _ = release.wait(timeout: .now() + 5)
+        }
+        defer { subscription.cancel() }
+        let removing = Task { await subject.didRemoveTrack(for: "remote", type: .video) }
+        await fulfillment(of: [began], timeout: 2)
+        await subject.didAddTrack(replacement, type: .video, for: "remote")
+        release.signal()
+        await removing.value
+        let actual = await subject.track(for: "remote", of: .video)
+        XCTAssertEqual(actual, replacement)
+    }
+
+    func test_videoUpscaling_departureRejectsLateReceiverDuringCleanup() async throws {
+        let participant = CallParticipant.dummy(trackLookupPrefix: "lookup", sessionId: "remote")
+        let key = VideoUpscalingTrack(participantSessionID: "remote")
+        await subject.enqueue { _ in [participant.sessionId: participant] }
+        await fulfillment { await self.subject.participants.count == 1 }
+        await subject.attachVideoUpscaling(lookupId: "lookup", trackType: .video, receiver: try makeReceiver())
+        await fulfillment { self.subject.videoUpscaling.statuses.value[key] != nil }
+        let began = expectation(description: "Departure cleanup suspended")
+        let released = DispatchSemaphore(value: 0)
+        defer { released.signal() }
+        let subscription = subject.videoUpscaling.statuses.sink { values in
+            guard values[key] == nil else { return }
+            began.fulfill()
+            _ = released.wait(timeout: .now() + 5)
+        }
+        defer { subscription.cancel() }
+        await subject.enqueue { _ in [:] }
+        await fulfillment(of: [began], timeout: 2)
+        await assertEqualAsync(await subject.participants.isEmpty, true)
+        let lateReceiver = try makeReceiver()
+        let ignored = expectation(description: "Late receiver ignored")
+        let attaching = Task {
+            await subject.attachVideoUpscaling(lookupId: "lookup", trackType: .video, receiver: lateReceiver)
+            ignored.fulfill()
+        }
+        await fulfillment(of: [ignored], timeout: 1)
+        released.signal()
+        await attaching.value
+        await fulfillment { self.subject.videoUpscaling.statuses.value[key] == nil }
+    }
+
+    func test_videoUpscaling_staleRemovalKeepsReplacementWithSameID() async throws {
+        let source = mockPeerConnectionFactory.makeVideoSource(forScreenShare: false)
+        let old = mockPeerConnectionFactory.factory.videoTrack(with: source, trackId: "same")
+        let replacement = mockPeerConnectionFactory.factory.videoTrack(with: source, trackId: "same")
+        await subject.didAddTrack(replacement, type: .video, for: "remote")
+        await subject.didRemoveTrack(for: "remote", type: .video, expectedTrack: old)
+        let actual = await subject.track(for: "remote", of: .video)
+        XCTAssertEqual(actual, replacement)
     }
 
     // MARK: - init

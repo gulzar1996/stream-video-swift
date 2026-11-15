@@ -14,6 +14,8 @@ StreamVideo.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved
 build/
 DerivedData/
 *.xcframework
+.webrtc-work/
+Scripts/**/__pycache__/
 
 # Interface Analyser
 stream-module-interface-analyser/

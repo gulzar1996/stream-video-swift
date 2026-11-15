@@ -113,6 +113,24 @@ class CallController: @unchecked Sendable {
                 mode: .throttle(scheduler: DispatchQueue.main, latest: true)
             )
             handleParticipantsUpdated()
+            videoUpscaling.settings
+                .removeDuplicates()
+                .receive(on: DispatchQueue.main)
+                .sink { [weak self] settings in
+                    MainActor.assumeIsolated {
+                        self?.call?.state.videoUpscalingDefault = settings.defaultConfiguration
+                        self?.call?.state.videoUpscalingOverrides = settings.overrides
+                    }
+                }
+                .store(in: disposableBag)
+            videoUpscaling.statuses
+                .receive(on: DispatchQueue.main)
+                .sink { [weak self] statuses in
+                    MainActor.assumeIsolated {
+                        self?.call?.state.videoUpscalingStatuses = statuses
+                    }
+                }
+                .store(in: disposableBag)
             await observeSessionIDUpdates()
             await observeStatsReporterUpdates()
             await observeCallSettingsUpdates()
@@ -120,6 +138,10 @@ class CallController: @unchecked Sendable {
             await observeOwnCapabilitiesUpdates()
             await observeSFUEvents()
         }
+    }
+
+    var videoUpscaling: VideoUpscalingController {
+        webRTCCoordinator.stateAdapter.videoUpscaling
     }
 
     func sessionID() async -> String { await webRTCCoordinator.stateAdapter.sessionID }
@@ -514,18 +536,28 @@ class CallController: @unchecked Sendable {
     }
 
     func leave(reason: String?, initiator: Call.LeaveInitiator = .unknown) {
-        guard call != nil else { return }
+        guard let departingCall = call else { return }
         call = nil
+        clearVideoUpscalingState(on: departingCall)
         webRTCCoordinator.leave(reason: reason, initiator: initiator)
     }
 
     /// Cleans up the call controller.
     func cleanUp() {
-        guard call != nil else { return }
+        guard let departingCall = call else { return }
         call = nil
+        clearVideoUpscalingState(on: departingCall)
         Task(disposableBag: disposableBag) { [weak self] in
             guard let self else { return }
             await webRTCCoordinator.cleanUp()
+        }
+    }
+
+    private func clearVideoUpscalingState(on call: Call) {
+        Task { @MainActor in
+            call.state.videoUpscalingStatuses = [:]
+            call.state.videoUpscalingDefault = .off
+            call.state.videoUpscalingOverrides = [:]
         }
     }
 

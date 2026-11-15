@@ -34,6 +34,9 @@ For prose-only changes, use structural and link checks.
    `Call.ring()`. Do not classify encoded requests in middleware.
    Check cancellation, stale completions, teardown, and error paths when
    asynchronous state changes.
+   For live controls, keep initialization and external state synchronization
+   free of user-action side effects. Test that opening the controls preserves
+   existing settings before enabling automatic updates.
 4. Update affected callers, behavior tests, and target membership.
    Match sibling membership in `StreamVideo.xcodeproj/project.pbxproj`.
    Check `Package.swift` for package resources and module changes.

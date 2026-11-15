@@ -17,6 +17,10 @@ Apply only the relevant sections.
 4. Use AppRTCMobile as a flow reference. Do not copy its signaling service or application architecture.
    Preserve existing SDK owners for signaling, permissions, lifecycle, and UI policy.
 
+Use the Ninja executable selected by the fork's build pipeline for auxiliary
+native targets too. A newer system Ninja can write an incompatible build log;
+the bundled Ninja then rebuilds the entire output directory.
+
 Native paths below start at the discovered WebRTC source root.
 
 | Area | Inspect |
@@ -45,6 +49,10 @@ Native paths below start at the discovered WebRTC source root.
 5. Route remote ICE by call, peer role, session, and ICE generation.
    Buffer candidates until the matching remote description succeeds, then apply them in arrival order.
   Drop stale candidates after restart or replacement.
+
+For ordered UI status, use serial main-queue delivery instead of replacing
+`sinkTask` tasks under one disposal key. A completed older task can remove and
+cancel a newer task with that key. Test final delivery under rapid updates.
 
 ## Resource ownership and overlapping calls
 
@@ -101,11 +109,17 @@ Native paths below start at the discovered WebRTC source root.
   Trace the actual CVPixelBuffer/NV12/I420 path before claiming zero-copy behavior.
   Buffer pools reduce allocations, but conversions can still copy pixels. Measure allocation and copy costs separately.
   Distinguish retained pool capacity from live frame ownership when investigating memory growth.
+- When converting Metal or RGB output to NV12, select the destination color
+  space from the input color attachments. Verify pixel values as well as
+  metadata; a nil destination color space can change the output luminance.
 
 ## Tuning, data, and diagnostics
 
 - Choose supported codecs and sender encoding parameters through exported APIs.
   Use stats to justify bitrate, frame-rate, or resolution changes. Avoid SDP string edits when supported APIs suffice.
+  Use the exported media-kind constants for capability queries. Check the
+  linked fork: its Objective-C bridge can compare NSString identity, so an
+  equal string literal from the caller can return no capabilities.
 - Centralize field-trial and metrics initialization. Check required ordering before other WebRTC calls.
   Prefer factory configuration over deprecated global setup when the linked API supports it.
 - Bound data-channel queues using channel state and `bufferedAmount`.
